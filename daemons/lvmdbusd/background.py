@@ -13,6 +13,7 @@ from .cmdhandler import options_to_cli_args, LvmExecutionMeta
 import dbus
 from .utils import pv_range_append, pv_dest_ranges, log_error, log_debug,\
 	add_no_notify
+import queue
 import os
 import threading
 import time
@@ -60,10 +61,14 @@ def _move_merge(interface_name, command, job_state):
 	log_debug("Background process for %s is %d" %
 				(str(command), process.pid))
 
-	lines_iterator = iter(process.stdout.readline, b"")
-	for line in lines_iterator:
-		line_str = line.decode("utf-8")
+	def reader(pipe, q):
+		try:
+			for line in iter(pipe.readline, b''):
+				q.put((pipe, line))
+		finally:
+			q.put((pipe, None))
 
+	def parse_percent(line_str, job_state, cfg):
 		# Check to see if the line has the correct number of separators
 		try:
 			if line_str.count(':') == 2:
@@ -78,19 +83,51 @@ def _move_merge(interface_name, command, job_state):
 			log_error("Trying to parse percentage which failed for %s" %
 				line_str)
 
-	out = process.communicate()
+	q = queue.Queue()
+	t1 = threading.Thread(target=reader, args=[process.stdout, q])
+	t2 = threading.Thread(target=reader, args=[process.stderr, q])
+
+	t1.start()
+	t2.start()
+
+	stdout_done = False
+	stderr_done = False
+	stderr = []
+
+	while not (stderr_done and stdout_done):
+		try:
+			source, line = q.get_nowait()
+			if source == process.stderr:
+				if line is not None:
+					line_str = line.decode("utf-8")
+					stderr.append(line_str)
+				else:
+					stderr_done = True
+			elif source == process.stdout:
+				if line is not None:
+					line_str = line.decode("utf-8")
+					parse_percent(line_str, job_state, cfg)
+				else:
+					stdout_done = True
+		except queue.Empty:
+			continue
+
+	process.wait()
+
+	t1.join()
+	t2.join()
 
 	with meta.lock:
 		meta.ended = time.time()
 		meta.ec = process.returncode
-		meta.stderr_txt = out[1]
+		meta.stderr_txt = stderr
 
 	if process.returncode == 0:
 		job_state.Percent = 100
 	else:
 		raise dbus.exceptions.DBusException(
 			interface_name,
-			'Exit code %s, stderr = %s' % (str(process.returncode), out[1]))
+			'Exit code %s, stderr = %s' % (str(process.returncode), stderr))
 
 	cfg.load()
 	return '/'
